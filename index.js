@@ -262,6 +262,12 @@ export function pathDenial(entry, { cwd, root, home, allow, sensitive }) {
 }
 
 /** Every string inside a tool's arguments (paths, patterns, commands). */
+/** A file name as a whole path segment: `settings.ini` matches `a/settings.ini`, not `settings.ini.example`. */
+export function namePattern(name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(^|[\\s/'"\`=(<>:;|&,])${escaped}($|[^\\w.-])`)
+}
+
 export function argStrings(value, out = []) {
   if (typeof value === 'string') out.push(value)
   else if (Array.isArray(value)) value.forEach(item => argStrings(item, out))
@@ -306,13 +312,20 @@ export function apply(ctx, config = {}) {
   const fixedRoot = config.workspaceRoot ? realish(expandHome(config.workspaceRoot)) : undefined
   const roots = new WeakMap() // agent -> workspace root (its first-seen cwd)
   const tainted = new Set()
+  const taintedNames = new Set()
 
   ctx.get('tools').guard((exec) => {
     const strings = argStrings(exec.arguments)
     // Taint: a file whose output was redacted may not be touched again (blocks slicing/encoding it).
+    // Match by file name too: `cd dir && cat name` reaches the same file through another path.
     for (const value of strings) {
       const hit = [...tainted].find(path => value.includes(path))
-      if (hit) return `[SECURITY GATE] ${exec.name} denied: ${hit} holds a redacted secret; work around that file`
+        ?? [...taintedNames].find(name => namePattern(name).test(value))
+      if (hit) {
+        return `[SECURITY GATE] ${exec.name} denied: ${hit} holds a redacted secret. This block is intentional: ` +
+          'do not access it by any means (other tools, paths, scripts or encodings). Leave that file unchanged, ' +
+          'finish the rest of the task, and list it in your final answer as blocked.'
+      }
     }
     try {
       return preVerdict(options, gateName(exec), exec.arguments)
@@ -334,6 +347,7 @@ export function apply(ctx, config = {}) {
         // unreadable here: taint it anyway, fail closed
       }
       tainted.add(absolute)
+      taintedNames.add(basename(absolute))
       const rel = relative(cwd, absolute)
       if (rel && !rel.startsWith('..')) tainted.add(rel)
     }

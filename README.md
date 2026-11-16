@@ -16,7 +16,7 @@ Thường không cần cài tay: [deepseek-worker](https://github.com/devtdq1701
 
 | Điểm chặn của dsh | Việc |
 |---|---|
-| `tools.guard()` | Chặn lệnh mà gate từ chối, hoặc gate muốn hỏi (chế độ headless không có người để hỏi, nên coi như từ chối). Chặn mọi lệnh nhắc tới file đã bị **taint**, tức file từng có secret bị che |
+| `tools.guard()` | Chặn lệnh mà gate từ chối, hoặc gate muốn hỏi (chế độ headless không có người để hỏi, nên coi như từ chối). Chặn mọi lệnh nhắc tới file đã bị **taint**, tức file từng có secret bị che (khớp theo đường dẫn hoặc tên file, nên `cd` sang thư mục khác rồi gọi đường dẫn tương đối vẫn bị chặn; glob như `*.ini` thì không bắt được) |
 | `tools/pre-execute` | **Giới hạn tool file:** resolve realpath theo cwd của session. Không đọc được `$HOME` ngoài workspace hay `homeAllow`; không ghi hay `cd` ra ngoài workspace; cấm `..`, `~user`, `/proc`, `/sys`, `/dev`, `sensitivePaths`; root của `grep`/`glob` không được chứa `$HOME`. **Chặn `web_fetch`/`read_url`:** tên nội bộ (`localhost`, `*.internal`, `*.corp`…), IP không public (kể cả các dạng IPv6 nhúng IPv4: mapped, NAT64, 6to4, Teredo), địa chỉ thuộc route cụ thể của máy (VPN, cluster, văn phòng), host không resolve được |
 | `tools/post-execute` | Thay secret trong output (và trong feedback khi tool bị block) bằng `<REDACTED:loại>` |
 | `tools/ptc-dispatch-log` | Che tương tự cho log của chế độ PTC |

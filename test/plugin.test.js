@@ -184,6 +184,11 @@ test('a file whose output was redacted is tainted for later calls', async () => 
     assert.match(guard({ name: 'read', arguments: { file_path: join(dir, 'config/settings.ini') } }), /holds a redacted secret/)
     assert.equal(guard({ name: 'bash', arguments: { command: 'python3 -m unittest' } }), undefined)
     assert.equal(guard({ name: 'edit', arguments: { file_path: 'clean.py' } }), undefined, 'a clean file named in the same command must not be tainted')
+    // Reaching it from another directory through a relative path is the same file.
+    const viaCd = { name: 'bash', arguments: { command: "cd config && python3 -c \"print(open('settings.ini').read()[-4:])\"" } }
+    assert.match(guard(viaCd), /holds a redacted secret/)
+    assert.match(guard(viaCd), /do not access it by any means/)
+    assert.equal(guard({ name: 'bash', arguments: { command: 'cat settings.ini.example my_settings.ini' } }), undefined)
   } finally {
     process.chdir(previous)
   }
