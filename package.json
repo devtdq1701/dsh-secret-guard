@@ -1,0 +1,11 @@
+{
+  "name": "dsh-secret-guard",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: run ~/.claude/hooks/security-gate.py natively — redact secrets in tool output before it reaches the model, deny unsafe tool calls, fail closed.",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js", "./package.json": "./package.json" },
+  "license": "MIT",
+  "private": true,
+  "scripts": { "test": "node --test test/*.test.js" }
+}
