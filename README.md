@@ -1,70 +1,109 @@
 # dsh-secret-guard
 
-DeepSeek Harness (dsh) plugin that runs `~/.claude/hooks/security-gate.py` on dsh's native tool seams, so DeepSeek workers get the same secret redaction and command gate as Claude Code.
+Plugin cho [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`), giúp agent DeepSeek làm việc an toàn hơn trên máy của anh. Plugin làm 4 việc:
+- **che secret** trong output của tool trước khi output tới model;
+- **giới hạn tool file** của dsh (`read`, `write`, `edit`, `grep`, `glob`…) trong phạm vi workspace;
+- **chặn `web_fetch`** tới mạng nội bộ và VPN;
+- **dừng dsh** nếu chính plugin không hoạt động được (fail-closed).
 
-| Seam | Behaviour |
+Plugin đi kèm một **gate dùng chung** (`gate/secret_gate.py`), viết theo chuẩn hook của Claude Code. Gate này dùng được cả trong plugin lẫn làm hook trực tiếp cho Claude Code.
+
+Thường không cần cài tay: [deepseek-worker](https://github.com/devtdq1701/deepseek-worker) có lệnh `dsw setup` tự cài và cấu hình plugin này. Hướng dẫn cài đặt đầy đủ, từ Node, dsh tới API key, nằm ở README của deepseek-worker.
+
+> **Trạng thái: thử nghiệm.** Đã kiểm với dsh `0.2.2-rc.3` và Node 24.
+
+## Plugin làm gì
+
+| Điểm chặn của dsh | Việc |
 |---|---|
-| `tools.guard()` | Deny a call the gate denies or would ask about (headless has no human to ask). |
-| `tools/post-execute` | Replace secret text in tool output (and block feedback) with the gate's `<REDACTED:...>` text. |
-| `tools/ptc-dispatch-log` | Same redaction for PTC dispatch log copies. |
-| `tools/pre-execute` | Deny `web_fetch` / `read_url` to internal names, non-public IPs and any address covered by a specific (VPN, cluster, office) route. |
+| `tools.guard()` | Chặn lệnh mà gate từ chối, hoặc gate muốn hỏi (chế độ headless không có người để hỏi, nên coi như từ chối). Chặn mọi lệnh nhắc tới file đã bị **taint**, tức file từng có secret bị che |
+| `tools/pre-execute` | **Giới hạn tool file:** resolve realpath theo cwd của session. Không đọc được `$HOME` ngoài workspace hay `homeAllow`; không ghi hay `cd` ra ngoài workspace; cấm `..`, `~user`, `/proc`, `/sys`, `/dev`, `sensitivePaths`; root của `grep`/`glob` không được chứa `$HOME`. **Chặn `web_fetch`/`read_url`:** tên nội bộ (`localhost`, `*.internal`, `*.corp`…), IP không public (kể cả các dạng IPv6 nhúng IPv4: mapped, NAT64, 6to4, Teredo), địa chỉ thuộc route cụ thể của máy (VPN, cluster, văn phòng), host không resolve được |
+| `tools/post-execute` | Thay secret trong output (và trong feedback khi tool bị block) bằng `<REDACTED:loại>` |
+| `tools/ptc-dispatch-log` | Che tương tự cho log của chế độ PTC |
 
-Fails closed:
+**Fail-closed:**
+- Khi khởi động, plugin tự test với một token giả. Nếu token đó không bị che, plugin không kích hoạt.
+- Patch của `dsw setup` cho entry bắt buộc `agent-loop` inject service `secretGuard`, nên thiếu plugin thì dsh báo `startup failed` và dừng.
+- Khi đang chạy, gate lỗi thì lệnh bị chặn hoặc output bị giữ lại.
 
-- At startup it runs a self-test: a canary token must come back redacted. If the gate is missing or the self-test fails, the plugin throws and its `secretGuard` service is absent.
-- Each profile patches the required entry `agent-loop` to inject `secretGuard`, so dsh refuses to start: `startup failed: 1 required plugin did not activate — secret-guard`.
-- If the gate fails at run time, the call is denied or its output is withheld.
+## Gate dùng chung
 
-## Install into a profile
+`gate/secret_gate.py` (Python ≥ 3.9, chỉ dùng thư viện chuẩn) đọc JSON hook trên stdin và ghi kết quả JSON ra stdout:
 
-Tested with dsh `0.2.2-rc.3` and Node 24.
+| Sự kiện | Hành vi |
+|---|---|
+| `PreToolUse` | **Từ chối:** tham số chứa credential; `sudo`/`su`/`doas`; `mkfs`; `dd of=/dev/…`; `rm -rf` ở `/`, `~` hay thư mục cha; `curl … \| sh`; tắt hoặc khởi động lại máy. **Hỏi:** `git push --force`, `git reset --hard`, `kubectl`/`helm`/`terraform` thay đổi hạ tầng, `docker … prune/rm`, SQL `DROP`/`TRUNCATE`, đọc file secret (`.env`, `id_rsa`, `*.pem`, `*.key`…), in toàn bộ env |
+| `PostToolUse` | Che secret: các key dạng `sk-`, Anthropic/OpenAI, Google, GitHub, GitLab, Slack, Stripe, npm, Hugging Face, AWS, private key, JWT, token Telegram, mật khẩu trong URL, `Basic`/`Bearer`, cặp `password=`/`token=`… |
+| `UserPromptSubmit` | Chặn prompt có chứa credential (thêm `[MOCK]` vào prompt để cho qua) |
 
-```bash
-dsh plugin --profile headless add link:$HOME/Workspace/tools/dsh-secret-guard
+Dùng làm hook cho chính Claude Code, thêm vào `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/src/dsh-secret-guard/gate/secret_gate.py" }] }],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "python3 ~/src/dsh-secret-guard/gate/secret_gate.py" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 ~/src/dsh-secret-guard/gate/secret_gate.py" }] }]
+  }
+}
 ```
 
-Then put the following in `~/.dsh/profiles/<profile>/cordis.patch.yml`:
+Muốn dùng gate riêng (luật chặt hơn, có các ngoại lệ của máy mình), chỉ cần gate đó theo cùng giao thức hook của Claude Code. Sau đó khai báo `gate = "..."` trong `~/.config/dsw/config.toml` rồi chạy `dsw setup`, hoặc đặt `gatePath` khi cài tay.
+
+## Cài tay (không qua dsw)
+
+```bash
+git clone https://github.com/devtdq1701/dsh-secret-guard.git ~/src/dsh-secret-guard
+dsh plugin --profile headless add link:$HOME/src/dsh-secret-guard
+```
+
+Thêm vào `~/.dsh/profiles/headless/cordis.patch.yml`:
 
 ```yaml
 - insert:
     - id: secret-guard
       name: 'dsh-secret-guard'
-      # config: { gatePath, python, timeoutMs }   # defaults: ~/.claude/hooks/security-gate.py, python3, 10000
+      config:
+        # gatePath: /path/to/gate.py        # mặc định: gate/secret_gate.py đi kèm
+        # sensitivePaths: ['~/.ssh', ...]   # mặc định: DEFAULT_SENSITIVE trong index.js
+        # homeAllow: ['~/.nvm', ...]        # toolchain được đọc; mặc định: DEFAULT_HOME_ALLOW
+        # workspaceRoot: /path/to/repo      # mặc định: cwd đầu tiên của mỗi session
+        # python: python3
+        # timeoutMs: 10000
 - id: agent-loop
-  inject: [secretGuard]
+  inject: [secretGuard]                     # bắt buộc: thiếu plugin thì dsh không khởi động
 ```
 
-It is installed in the `headless` and `web` profiles. `web` is the dsh-crew hub; restart `dsh web` after changing that profile.
-
-## Verify
+Kiểm tra cấu hình:
 
 ```bash
-node --test test/*.test.js   # healthy: "# pass 13", "# fail 0"
+dsh --profile headless --dump-config | grep -A3 'id: secret-guard'
 ```
 
-Live checks run on 2026-11-16 against a repo holding a fake GitHub-format token:
+Kết quả phải có dòng `name: dsh-secret-guard`.
 
-- **headless probe:** read + cat of the token file showed 0 raw occurrences in the event stream, and both tool results stayed `completed` with `<REDACTED:GitHub Token>`.
-- **full coding task:** visible and hidden tests passed, and the token did not leak.
-- **broken `gatePath`:** dsh exited 1 at startup.
-- **dsh-crew `dsh_run_worker` (hub):** the session log on disk had 0 raw occurrences and 13 redaction markers.
+Plugin chỉ giới hạn **tool file** của dsh. Tool bash phải được giới hạn bằng sandbox, ví dụ `sandbox/dsw-bwrap` của deepseek-worker: `$HOME` rỗng, không `/run`, không mạng.
 
-## Limits
+## Kiểm thử
 
-- **Tool name mapping:** dsh tool names are mapped to Claude Code names: bash→Bash, read→Read, write→Write, edit→Edit, glob→Glob, grep→Grep. Other tools are passed under their own names, so the gate only scans their arguments and output for secrets.
-- **Cost per call:** each tool call spawns the gate twice (pre and post), about 50–100 ms each.
-- **Secret scope:** only secret formats the gate knows are redacted. Proprietary code still goes to DeepSeek.
-- **Transformations pass through:** a model that deliberately transforms a secret gets past pattern redaction. In a 2026-11-16 live test, a script printed a token's length and last 4 characters, and that output was not redacted. Keep live credentials out of worker workspaces.
-- **Untouched paths:** `additionalContexts` messages added by other plugins, and PTC execution-local `value`s, are not rewritten. Printed output of those values is redacted.
+```bash
+npm test
+```
 
-## Path policy (2026-11-16)
+Kết quả mong đợi gồm 2 phần:
+- test của plugin (Node): `# pass 13`, `# fail 0`;
+- test của gate (Python): `Ran 6 tests` rồi `OK`.
 
-dsh's file tools (`read`, `read_image`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `working_directory`) run outside bwrap, so `tools/pre-execute` confines them:
+Token giả trong test được ghép từ nhiều mảnh lúc chạy, nên repo không chứa secret dạng nguyên văn.
 
-- **Resolution:** paths resolve against the session cwd, with realpath applied to the longest existing prefix.
-- **Always denied:** `..`, `~user`, `/proc`, `/sys`, `/dev` (except `/dev/null`) and `sensitivePaths`.
-- **Writes and `cd`:** only inside the workspace (the agent's first-seen cwd, or `workspaceRoot`).
-- **Reads under `$HOME`:** only inside the workspace or `homeAllow`.
-- **Search roots:** may not contain `$HOME`.
+## Giới hạn
 
-`dsw setup` passes `sensitivePaths` and `homeAllow` from deepseek-worker's `sandbox/*.txt`.
+- Che theo pattern chỉ là best effort. Secret định dạng lạ, hoặc bị worker copy rồi biến đổi trong workspace, sẽ không bị che. Không để credential thật trong workspace.
+- `web_fetch` có thể bị DNS rebinding giữa lúc plugin kiểm tra và lúc dsh fetch.
+- Với hub (`dsh web`), workspace được lấy theo cwd đầu tiên của mỗi session.
+- Mỗi tool call chạy gate 2 lần (trước và sau), mỗi lần khoảng 50–100 ms.
+- Các thông điệp `additionalContexts` do plugin khác thêm vào, và `value` nội bộ của chế độ PTC, không được che. Output in ra từ các giá trị đó thì vẫn được che.
+
+## Giấy phép
+
+MIT. Xem [LICENSE](LICENSE).

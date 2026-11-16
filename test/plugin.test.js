@@ -98,7 +98,6 @@ test('ptc dispatch log copies are redacted', async () => {
 })
 
 test('file tools are confined: home default-deny, credential paths, spelling and symlink bypasses', async () => {
-  const realGate = join(process.env.HOME, '.claude/hooks/security-gate.py')
   const fake = mkdtempSync(join(tmpdir(), 'secret-guard-home-'))
   const ws = join(fake, 'proj')
   mkdirSync(join(fake, '.aws'), { recursive: true })
@@ -113,7 +112,7 @@ test('file tools are confined: home default-deny, credential paths, spelling and
   process.chdir(ws)
   try {
     const ctx = fakeCtx()
-    apply(ctx, { gatePath: realGate })
+    apply(ctx)
     const pre = ctx.handlers['tools/pre-execute']
     const allow = async () => ({ kind: 'allow' })
     const kind = async (name, args) => (await pre({ name, arguments: args }, allow)).kind

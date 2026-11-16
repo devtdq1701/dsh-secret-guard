@@ -1,5 +1,5 @@
 /**
- * dsh-secret-guard: run the Claude Code security gate (~/.claude/hooks/security-gate.py)
+ * dsh-secret-guard: run a Claude Code-compatible secret gate (default: the bundled gate/secret_gate.py)
  * on DeepSeek Harness's native tool seams.
  *
  * - tools.guard(): deny a call the gate denies or would ask about (headless has no human).
@@ -15,6 +15,7 @@ import { spawnSync } from 'node:child_process'
 import { lookup } from 'node:dns/promises'
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { isIP } from 'node:net'
+import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 
@@ -290,7 +291,7 @@ export function candidatePaths(exec, cwd) {
 
 export function apply(ctx, config = {}) {
   const options = {
-    gate: config.gatePath ?? join(homedir(), '.claude/hooks/security-gate.py'),
+    gate: config.gatePath ?? fileURLToPath(new URL('./gate/secret_gate.py', import.meta.url)),
     python: config.python ?? 'python3',
     timeoutMs: config.timeoutMs ?? 10000,
   }
