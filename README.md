@@ -1,6 +1,6 @@
 # dsh-secret-guard
 
-Plugin cho [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`), giúp agent DeepSeek làm việc an toàn hơn trên máy của anh. Plugin làm 4 việc:
+Plugin cho [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`), giúp agent DeepSeek làm việc an toàn hơn trên máy của bạn. Plugin làm 4 việc:
 - **che secret** trong output của tool trước khi output tới model;
 - **giới hạn tool file** của dsh (`read`, `write`, `edit`, `grep`, `glob`…) trong phạm vi workspace;
 - **chặn `web_fetch`** tới mạng nội bộ và VPN;
