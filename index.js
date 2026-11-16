@@ -13,10 +13,10 @@
  */
 import { spawnSync } from 'node:child_process'
 import { lookup } from 'node:dns/promises'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { isIP } from 'node:net'
 import { homedir } from 'node:os'
-import { join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 
 export const name = 'secret-guard'
 
@@ -26,16 +26,47 @@ function defaultDev() {
   return out.match(/\bdev (\S+)/)?.[1]
 }
 
-/** True for loopback, private, link-local, CGNAT, multicast, reserved and unique-local addresses. */
-export function isNonPublicIp(ip) {
-  if (isIP(ip) === 4) {
-    const [a, b] = ip.split('.').map(Number)
-    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b < 128)
-      || (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168)
+/** IP literal -> byte array (4 or 16 bytes), or null when it is not an IP literal. */
+export function ipBytes(ip) {
+  if (isIP(ip) === 4) return ip.split('.').map(Number)
+  if (isIP(ip) !== 6) return null
+  let text = ip.toLowerCase().split('%')[0]
+  const dotted = text.match(/(\d+\.\d+\.\d+\.\d+)$/)
+  let tail = null
+  if (dotted) {
+    tail = dotted[1].split('.').map(Number)
+    text = text.slice(0, -dotted[1].length) + '0:0'
   }
-  const v6 = ip.toLowerCase()
-  if (v6.startsWith('::ffff:')) return isNonPublicIp(v6.slice(7))
-  return v6 === '::' || v6 === '::1' || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6) || v6.startsWith('ff')
+  const [head, rest] = text.split('::')
+  const h = head ? head.split(':') : []
+  const r = rest === undefined ? null : (rest ? rest.split(':') : [])
+  const groups = r === null ? h : [...h, ...Array(Math.max(0, 8 - h.length - r.length)).fill('0'), ...r]
+  if (groups.length !== 8) return null
+  const bytes = groups.flatMap((g) => { const v = parseInt(g || '0', 16); return [(v >> 8) & 255, v & 255] })
+  if (tail) bytes.splice(12, 4, ...tail)
+  return bytes
+}
+
+function v4NonPublic([a, b, c]) {
+  return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b < 128)
+    || (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168)
+    || (a === 192 && b === 0 && (c === 0 || c === 2)) || (a === 198 && (b === 18 || b === 19))
+    || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113)
+}
+
+/** True unless the address is public unicast. IPv6 forms that embed or tunnel IPv4
+ * (mapped, compatible, NAT64, 6to4, Teredo) are judged by — or denied for — that IPv4. */
+export function isNonPublicIp(ip) {
+  const b = ipBytes(ip)
+  if (!b) return true
+  if (b.length === 4) return v4NonPublic(b)
+  if (b.slice(0, 10).every(x => x === 0) && b[10] === 255 && b[11] === 255) return v4NonPublic(b.slice(12))
+  if (b.slice(0, 12).every(x => x === 0)) return true // ::, ::1, IPv4-compatible
+  if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b) return true // NAT64
+  if (b[0] === 0x20 && b[1] === 0x02) return true // 6to4
+  if (b[0] === 0x20 && b[1] === 0x01 && b[2] === 0 && b[3] === 0) return true // Teredo
+  if (b[0] === 0x20 && b[1] === 0x01 && b[2] === 0x0d && b[3] === 0xb8) return true // documentation
+  return (b[0] & 0xe0) !== 0x20 // only 2000::/3 is global unicast
 }
 
 /** 'ok' public via default route, 'bad' non-public or routed elsewhere, 'none' unroutable. */
@@ -75,15 +106,16 @@ export async function urlDenial(raw) {
     return undefined // not a URL argument
   }
   if (!/^https?:$/.test(url.protocol)) return `scheme ${url.protocol} not allowed`
-  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
-  if (host === 'localhost' || /\.(local|internal|lan|home|corp|intranet|localdomain)$/.test(host)) {
-    return `${host} is an internal name`
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase().replace(/\.+$/, '')
+  if (!host || host === 'localhost' || !host.includes('.') && !isIP(host)
+    || /\.(local|internal|lan|home|corp|intranet|localdomain|localhost)$/.test(host)) {
+    return `${host || '(empty)'} is an internal name`
   }
   let addresses
   try {
     addresses = isIP(host) ? [host] : (await lookup(host, { all: true })).map(entry => entry.address)
   } catch {
-    return undefined // unresolvable: the fetch itself will fail
+    return `${host} does not resolve here` // fail closed: the fetch may resolve differently
   }
   const dev = defaultDev()
   const classes = addresses.map(ip => routeClass(ip, dev))
@@ -116,6 +148,8 @@ export function redactBlocks(options, toolName, blocks) {
   const out = runGate(options, {
     hook_event_name: 'PostToolUse', tool_name: toolName, tool_input: {}, tool_response: texts,
   })
+  // The gate reports its own redaction errors as a bare systemMessage: treat that as a failure.
+  if (out && out.systemMessage && !out.hookSpecificOutput) throw new Error(`gate error: ${out.systemMessage}`)
   const updated = out?.hookSpecificOutput?.updatedToolOutput
   if (!Array.isArray(updated)) return null
   return blocks.map((block, index) => block.type === 'text' ? { ...block, text: String(updated[index]) } : block)
@@ -140,13 +174,91 @@ export function selfTest(options) {
   }
 }
 
-/** Credential locations the worker never needs; mirrors sandbox/dsw-bwrap in deepseek-worker. */
+/** Credential locations the worker never needs (also denied inside allowed dirs). Normally
+ * replaced by `sensitivePaths` from `dsw setup` (deepseek-worker sandbox/hidden-paths.txt). */
 export const DEFAULT_SENSITIVE = [
-  '~/.ssh', '~/.kube', '~/.aws', '~/.gnupg', '~/.docker', '~/.claude', '~/.claude.json', '~/.codex', '~/.dsh',
-  '~/.gemini', '~/.config/deepseek-worker', '~/.config/gh', '~/.config/gcloud', '~/.config/dsh-crew',
-  '~/.local/share/keyrings', '~/.local/state/dsw', '~/.password-store', '~/.netrc', '~/.git-credentials',
-  '~/.npmrc', '~/.pypirc',
+  '~/.ssh', '~/.kube', '~/.aws', '~/.azure', '~/.gnupg', '~/.docker', '~/.claude', '~/.claude.json', '~/.codex',
+  '~/.dsh', '~/.gemini', '~/.config/dsw', '~/.config/deepseek-worker', '~/.config/gh', '~/.config/gcloud',
+  '~/.config/dsh-crew', '~/.local/share/keyrings', '~/.local/state/dsw', '~/.password-store', '~/.netrc',
+  '~/.git-credentials', '~/.npmrc', '~/.pypirc',
 ]
+
+/** Home paths file tools may READ (toolchains). Everything else under $HOME is denied unless it
+ * is inside the workspace. Normally replaced by `homeAllow` from `dsw setup`. */
+export const DEFAULT_HOME_ALLOW = [
+  '~/.nvm', '~/.local/bin', '~/.local/lib', '~/.local/share/pnpm', '~/.cargo/bin', '~/.rustup', '~/.pyenv',
+  '~/go/pkg/mod', '~/.deno', '~/.bun/bin',
+]
+
+const expandHome = p => (p === '~' ? homedir() : p.startsWith('~/') ? homedir() + p.slice(1) : p)
+const under = (p, root) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep)
+
+/** realpath of the longest existing prefix, plus the non-existent rest (resolves symlinks). */
+export function realish(p) {
+  let current = p
+  const rest = []
+  for (;;) {
+    try {
+      return join(realpathSync(current), ...rest)
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) return p
+      rest.unshift(basename(current))
+      current = parent
+    }
+  }
+}
+
+/** Path arguments of dsh file tools, with the access each one needs. */
+export function fileToolPaths(exec) {
+  const args = exec.arguments ?? {}
+  const out = []
+  const add = (raw, mode) => { if (typeof raw === 'string' && raw !== '') out.push({ raw, mode }) }
+  switch (exec.name) {
+    case 'read': case 'read_image': add(args.file_path, 'read'); break
+    case 'write': case 'edit': add(args.file_path, 'write'); break
+    case 'apply_patch':
+      for (const text of argStrings(args)) {
+        for (const m of text.matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+?)\s*$/gm)) add(m[1], 'write')
+      }
+      break
+    case 'grep': case 'glob': {
+      add(args.path ?? '.', 'search')
+      const pattern = typeof args.pattern === 'string' ? args.pattern : ''
+      if (exec.name === 'glob' && /^[~/]/.test(pattern)) add(pattern.split(/[*?[{]/)[0] || '/', 'search')
+      break
+    }
+    case 'working_directory': add(args.cd, 'cd'); break
+    default:
+      for (const key of ['file_path', 'path', 'filePath']) add(args[key], 'read')
+  }
+  return out
+}
+
+/** Why a file-tool path is refused, or undefined. `cwd` is the session cwd, `root` the workspace. */
+export function pathDenial(entry, { cwd, root, home, allow, sensitive }) {
+  const raw = entry.raw
+  if (raw.startsWith('~') && raw !== '~' && !raw.startsWith('~/')) return `${raw}: ~user paths are not allowed`
+  if (raw.split(/[\\/]+/).includes('..')) return `${raw}: '..' segments are not allowed`
+  const lexical = resolve(cwd, expandHome(raw))
+  const real = realish(lexical)
+  const both = [lexical, real]
+  for (const p of both) {
+    if (/^\/(proc|sys)(\/|$)/.test(p) || (/^\/dev(\/|$)/.test(p) && p !== '/dev/null')) return `${raw}: ${p} is off limits`
+  }
+  for (const p of both) {
+    const hit = sensitive.find(s => under(p, s))
+    if (hit) return `${raw}: ${hit} is a protected credential path`
+  }
+  const inRoot = both.every(p => under(p, root))
+  if (entry.mode === 'write' || entry.mode === 'cd') return inRoot ? undefined : `${raw}: outside the workspace ${root}`
+  if (entry.mode === 'search' && both.some(p => under(home, p))) return `${raw}: search root contains the home directory`
+  if (inRoot) return undefined
+  if (both.some(p => under(p, home)) && !allow.some(a => both.every(p => under(p, a)))) {
+    return `${raw}: home paths outside the workspace are not readable`
+  }
+  return undefined
+}
 
 /** Every string inside a tool's arguments (paths, patterns, commands). */
 export function argStrings(value, out = []) {
@@ -187,19 +299,15 @@ export function apply(ctx, config = {}) {
   ctx.provide('secretGuard', { gate: options.gate, selfTested: true })
   const gateName = exec => TOOL_NAMES[exec.name] ?? exec.name
 
-  const sensitive = (config.sensitivePaths ?? DEFAULT_SENSITIVE).map(path => path.replace(/^~(?=\/|$)/, homedir()))
+  const realHome = realish(homedir())
+  const sensitive = (config.sensitivePaths ?? DEFAULT_SENSITIVE).map(p => realish(expandHome(p)))
+  const homeAllow = (config.homeAllow ?? DEFAULT_HOME_ALLOW).map(p => realish(expandHome(p)))
+  const fixedRoot = config.workspaceRoot ? realish(expandHome(config.workspaceRoot)) : undefined
+  const roots = new WeakMap() // agent -> workspace root (its first-seen cwd)
   const tainted = new Set()
 
   ctx.get('tools').guard((exec) => {
     const strings = argStrings(exec.arguments)
-    const cwd = process.cwd()
-    // dsh file tools run in this node process, outside bwrap: keep them off credential paths.
-    for (const value of strings) {
-      const resolved = value.startsWith('~') ? value.replace(/^~/, homedir()) : resolve(cwd, value)
-      const hit = sensitive.find(path => resolved === path || resolved.startsWith(path + sep)
-        || value.includes(path) || value.includes(path.replace(homedir(), '~')))
-      if (hit) return `[SECURITY GATE] ${exec.name} denied: ${hit} is a protected credential path`
-    }
     // Taint: a file whose output was redacted may not be touched again (blocks slicing/encoding it).
     for (const value of strings) {
       const hit = [...tainted].find(path => value.includes(path))
@@ -236,6 +344,29 @@ export function apply(ctx, config = {}) {
     if (exec.name === 'web_fetch' || exec.name === 'read_url') {
       for (const value of argStrings(exec.arguments)) {
         const denial = await urlDenial(value)
+        if (denial) return { kind: 'deny', reason: `[SECURITY GATE] ${exec.name} denied: ${denial}` }
+      }
+    }
+    // dsh file tools run in this node process, outside bwrap: confine them like the sandbox does.
+    const entries = fileToolPaths(exec)
+    if (entries.length > 0) {
+      let cwd = realish(process.cwd())
+      try {
+        const wd = ctx.get('workingDirectory')
+        if (wd && exec.agent) cwd = realish(await wd.ensure(exec.agent, exec.signal))
+      } catch {
+        return { kind: 'deny', reason: `[SECURITY GATE] ${exec.name} denied: session working directory unavailable` }
+      }
+      let root = fixedRoot ?? (exec.agent ? roots.get(exec.agent) : undefined)
+      if (!root) {
+        root = cwd
+        if (exec.agent) roots.set(exec.agent, root)
+      }
+      if (!under(cwd, root)) {
+        return { kind: 'deny', reason: `[SECURITY GATE] ${exec.name} denied: session cwd ${cwd} left the workspace ${root}` }
+      }
+      for (const entry of entries) {
+        const denial = pathDenial(entry, { cwd, root, home: realHome, allow: homeAllow, sensitive })
         if (denial) return { kind: 'deny', reason: `[SECURITY GATE] ${exec.name} denied: ${denial}` }
       }
     }

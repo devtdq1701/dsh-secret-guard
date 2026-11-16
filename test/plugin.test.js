@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, selfTest } from '../index.js'
+import { apply, selfTest, urlDenial } from '../index.js'
 
 const TOKEN = 'gh' + 'p_' + 'Zx9'.repeat(12)
 
@@ -97,14 +97,72 @@ test('ptc dispatch log copies are redacted', async () => {
   assert.ok(!out[0].text.includes(TOKEN))
 })
 
-test('file tools and commands on credential paths are denied', () => {
+test('file tools are confined: home default-deny, credential paths, spelling and symlink bypasses', async () => {
+  const realGate = join(process.env.HOME, '.claude/hooks/security-gate.py')
+  const fake = mkdtempSync(join(tmpdir(), 'secret-guard-home-'))
+  const ws = join(fake, 'proj')
+  mkdirSync(join(fake, '.aws'), { recursive: true })
+  writeFileSync(join(fake, '.aws', 'credentials'), 'x')
+  mkdirSync(join(fake, '.config', 'other'), { recursive: true })
+  writeFileSync(join(fake, '.bash_history'), 'x')
+  mkdirSync(join(fake, '.nvm'), { recursive: true })
+  mkdirSync(join(ws, 'sub'), { recursive: true })
+  symlinkSync(join(fake, '.aws'), join(ws, 'link'))
+  const previous = { home: process.env.HOME, cwd: process.cwd() }
+  process.env.HOME = fake
+  process.chdir(ws)
+  try {
+    const ctx = fakeCtx()
+    apply(ctx, { gatePath: realGate })
+    const pre = ctx.handlers['tools/pre-execute']
+    const allow = async () => ({ kind: 'allow' })
+    const kind = async (name, args) => (await pre({ name, arguments: args }, allow)).kind
+    for (const [name, args] of [
+      ['read', { file_path: '~/.aws/credentials' }], ['read', { file_path: '~//.aws/credentials' }],
+      ['read', { file_path: '~/./.aws/credentials' }], ['read', { file_path: 'link/credentials' }],
+      ['read', { file_path: `/proc/self/root${fake}/.aws/credentials` }], ['read', { file_path: '../.bash_history' }],
+      ['read', { file_path: `${fake}/.bash_history` }], ['read', { file_path: '~root/.ssh/id_rsa' }],
+      ['read', { file_path: `${fake}/.config/other/x` }], ['grep', { pattern: '.', path: fake, include: '.aws/*' }],
+      ['glob', { pattern: '.aws/*', path: fake }], ['glob', { pattern: '~/.aw?' }], ['grep', { pattern: 'x', path: '/' }],
+      ['write', { file_path: `${fake}/evil` }], ['edit', { file_path: '/etc/hosts' }],
+      ['apply_patch', { patch: `*** Begin Patch\n*** Add File: ${fake}/evil\n+x\n*** End Patch` }],
+      ['working_directory', { cd: fake }], ['working_directory', { cd: '/' }],
+    ]) {
+      assert.equal(await kind(name, args), 'deny', `${name} ${JSON.stringify(args)}`)
+    }
+    for (const [name, args] of [
+      ['read', { file_path: 'sub/file.py' }], ['read', { file_path: `${ws}/sub/file.py` }], ['write', { file_path: 'new.py' }],
+      ['read', { file_path: '/usr/lib/os-release' }], ['read', { file_path: `${fake}/.nvm/x` }],
+      ['grep', { pattern: 'x' }], ['glob', { pattern: '**/*.py' }], ['working_directory', { cd: 'sub' }],
+      ['bash', { command: 'cat ~/.aws/credentials' }], // bash is confined by the bwrap sandbox, not here
+    ]) {
+      assert.equal(await kind(name, args), 'allow', `${name} ${JSON.stringify(args)}`)
+    }
+  } finally {
+    process.env.HOME = previous.home
+    process.chdir(previous.cwd)
+  }
+})
+
+test('web_fetch denies IPv4-embedding IPv6 forms, trailing-dot internal names and unresolvable hosts', async () => {
+  for (const url of ['http://[::ffff:127.0.0.1]/', 'http://[::ffff:10.0.0.5]/', 'http://[::ffff:169.254.169.254]/',
+    'http://[::127.0.0.1]/', 'http://[64:ff9b::7f00:1]/', 'http://[2002:7f00:1::]/', 'http://[2001:0:4136::1]/',
+    'http://[fe80::1]/', 'http://[fd00::1]/', 'http://metadata.google.internal./', 'http://x.corp./',
+    'http://intranet/', 'http://2130706433/', 'http://127.1/', 'http://no-such-host.invalid/']) {
+    assert.ok(await urlDenial(url), url)
+  }
+  assert.equal(await urlDenial('https://[2606:4700:4700::1111]/'), undefined)
+})
+
+test('a gate error reported as a bare systemMessage withholds the output', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'secret-guard-gate-'))
+  const gate = join(dir, 'gate.py')
+  writeFileSync(gate, `import json, sys\nd = json.load(sys.stdin)\ntext = json.dumps(d)\nif "Q7Q7" in text:\n    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": [t.replace("Q7", "") if t else t for t in d["tool_response"]]}}))\nelif d.get("hook_event_name") == "PostToolUse":\n    print(json.dumps({"systemMessage": "gate failed"}))\n`)
   const ctx = fakeCtx()
-  apply(ctx)
-  const guard = ctx.guards[0]
-  assert.match(guard({ name: 'read', arguments: { file_path: '~/.ssh/id_ed25519' } }), /protected credential path/)
-  assert.match(guard({ name: 'grep', arguments: { pattern: 'x', path: `${process.env.HOME}/.kube` } }), /protected credential path/)
-  assert.match(guard({ name: 'bash', arguments: { command: 'cat ~/.config/deepseek-worker/api_key' } }), /protected credential path/)
-  assert.equal(guard({ name: 'read', arguments: { file_path: 'textstats/stats.py' } }), undefined)
+  apply(ctx, { gatePath: gate })
+  const post = ctx.handlers['tools/post-execute']
+  const out = await post({ name: 'bash' }, { content: [{ type: 'text', text: 'anything' }] }, async () => ({ kind: 'accept' }))
+  assert.match(out.content[0].text, /withheld/)
 })
 
 test('a file whose output was redacted is tainted for later calls', async () => {

@@ -39,7 +39,7 @@ It is installed in the `headless` and `web` profiles. `web` is the dsh-crew hub;
 ## Verify
 
 ```bash
-node --test test/*.test.js   # healthy: "# pass 11", "# fail 0"
+node --test test/*.test.js   # healthy: "# pass 13", "# fail 0"
 ```
 
 Live checks run on 2026-11-16 against a repo holding a fake GitHub-format token:
@@ -56,3 +56,15 @@ Live checks run on 2026-11-16 against a repo holding a fake GitHub-format token:
 - **Secret scope:** only secret formats the gate knows are redacted. Proprietary code still goes to DeepSeek.
 - **Transformations pass through:** a model that deliberately transforms a secret gets past pattern redaction. In a 2026-11-16 live test, a script printed a token's length and last 4 characters, and that output was not redacted. Keep live credentials out of worker workspaces.
 - **Untouched paths:** `additionalContexts` messages added by other plugins, and PTC execution-local `value`s, are not rewritten. Printed output of those values is redacted.
+
+## Path policy (2026-11-16)
+
+dsh's file tools (`read`, `read_image`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `working_directory`) run outside bwrap, so `tools/pre-execute` confines them:
+
+- **Resolution:** paths resolve against the session cwd, with realpath applied to the longest existing prefix.
+- **Always denied:** `..`, `~user`, `/proc`, `/sys`, `/dev` (except `/dev/null`) and `sensitivePaths`.
+- **Writes and `cd`:** only inside the workspace (the agent's first-seen cwd, or `workspaceRoot`).
+- **Reads under `$HOME`:** only inside the workspace or `homeAllow`.
+- **Search roots:** may not contain `$HOME`.
+
+`dsw setup` passes `sensitivePaths` and `homeAllow` from deepseek-worker's `sandbox/*.txt`.
